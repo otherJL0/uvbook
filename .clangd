@@ -1,0 +1,2 @@
+CompileFlags:
+  CompilationDatabase: libuv/build/       # Search for compile_commands.json
