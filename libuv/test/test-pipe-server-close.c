@@ -61,11 +61,14 @@ static void pipe_server_connection_cb(uv_stream_t* handle, int status) {
 
 
 TEST_IMPL(pipe_server_close) {
+#if defined(NO_SELF_CONNECT)
+  RETURN_SKIP(NO_SELF_CONNECT);
+#endif
   uv_loop_t* loop;
   int r;
 
   loop = uv_default_loop();
-  ASSERT(loop != NULL);
+  ASSERT_NOT_NULL(loop);
 
   r = uv_pipe_init(loop, &pipe_server, 0);
   ASSERT(r == 0);

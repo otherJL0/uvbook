@@ -36,7 +36,7 @@ static int close_cb_called = 0;
 
 
 static void close_cb(uv_handle_t* handle) {
-  ASSERT(handle != NULL);
+  ASSERT_NOT_NULL(handle);
   close_cb_called++;
 }
 
@@ -116,6 +116,9 @@ TEST_IMPL(pipe_bind_error_inval) {
 
 
 TEST_IMPL(pipe_listen_without_bind) {
+#if defined(NO_SELF_CONNECT)
+  RETURN_SKIP(NO_SELF_CONNECT);
+#endif
   uv_pipe_t server;
   int r;
 

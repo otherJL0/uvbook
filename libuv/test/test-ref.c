@@ -154,7 +154,7 @@ TEST_IMPL(check_ref) {
 
 
 static void prepare_cb(uv_prepare_t* h) {
-  ASSERT(h != NULL);
+  ASSERT_NOT_NULL(h);
   uv_unref((uv_handle_t*)h);
 }
 
@@ -194,6 +194,9 @@ TEST_IMPL(timer_ref2) {
 
 
 TEST_IMPL(fs_event_ref) {
+#if defined(NO_FS_EVENTS)
+  RETURN_SKIP(NO_FS_EVENTS);
+#endif
   uv_fs_event_t h;
   uv_fs_event_init(uv_default_loop(), &h);
   uv_fs_event_start(&h, (uv_fs_event_cb)fail_cb, ".", 0);

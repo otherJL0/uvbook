@@ -40,8 +40,12 @@
 extern char **environ;
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__GLIBC__)
 # include <grp.h>
+#endif
+
+#if defined(__MVS__)
+# include "zos-base.h"
 #endif
 
 
@@ -111,76 +115,6 @@ static void uv__chld(uv_signal_t* handle, int signum) {
   assert(QUEUE_EMPTY(&pending));
 }
 
-
-int uv__make_socketpair(int fds[2], int flags) {
-#if defined(__linux__)
-  static int no_cloexec;
-
-  if (no_cloexec)
-    goto skip;
-
-  if (socketpair(AF_UNIX, SOCK_STREAM | UV__SOCK_CLOEXEC | flags, 0, fds) == 0)
-    return 0;
-
-  /* Retry on EINVAL, it means SOCK_CLOEXEC is not supported.
-   * Anything else is a genuine error.
-   */
-  if (errno != EINVAL)
-    return -errno;
-
-  no_cloexec = 1;
-
-skip:
-#endif
-
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds))
-    return -errno;
-
-  uv__cloexec(fds[0], 1);
-  uv__cloexec(fds[1], 1);
-
-  if (flags & UV__F_NONBLOCK) {
-    uv__nonblock(fds[0], 1);
-    uv__nonblock(fds[1], 1);
-  }
-
-  return 0;
-}
-
-
-int uv__make_pipe(int fds[2], int flags) {
-#if defined(__linux__)
-  static int no_pipe2;
-
-  if (no_pipe2)
-    goto skip;
-
-  if (uv__pipe2(fds, flags | UV__O_CLOEXEC) == 0)
-    return 0;
-
-  if (errno != ENOSYS)
-    return -errno;
-
-  no_pipe2 = 1;
-
-skip:
-#endif
-
-  if (pipe(fds))
-    return -errno;
-
-  uv__cloexec(fds[0], 1);
-  uv__cloexec(fds[1], 1);
-
-  if (flags & UV__F_NONBLOCK) {
-    uv__nonblock(fds[0], 1);
-    uv__nonblock(fds[1], 1);
-  }
-
-  return 0;
-}
-
-
 /*
  * Used for initializing stdio streams like options.stdin_stream. Returns
  * zero on success. See also the cleanup section in uv_spawn().
@@ -198,9 +132,9 @@ static int uv__process_init_stdio(uv_stdio_container_t* container, int fds[2]) {
   case UV_CREATE_PIPE:
     assert(container->data.stream != NULL);
     if (container->data.stream->type != UV_NAMED_PIPE)
-      return -EINVAL;
+      return UV_EINVAL;
     else
-      return uv__make_socketpair(fds, 0);
+      return uv_socketpair(SOCK_STREAM, 0, fds, 0, 0);
 
   case UV_INHERIT_FD:
   case UV_INHERIT_STREAM:
@@ -210,40 +144,38 @@ static int uv__process_init_stdio(uv_stdio_container_t* container, int fds[2]) {
       fd = uv__stream_fd(container->data.stream);
 
     if (fd == -1)
-      return -EINVAL;
+      return UV_EINVAL;
 
     fds[1] = fd;
     return 0;
 
   default:
     assert(0 && "Unexpected flags");
-    return -EINVAL;
+    return UV_EINVAL;
   }
 }
 
 
 static int uv__process_open_stream(uv_stdio_container_t* container,
-                                   int pipefds[2],
-                                   int writable) {
+                                   int pipefds[2]) {
   int flags;
+  int err;
 
   if (!(container->flags & UV_CREATE_PIPE) || pipefds[0] < 0)
     return 0;
 
-  if (uv__close(pipefds[1]))
-    if (errno != EINTR && errno != EINPROGRESS)
-      abort();
+  err = uv__close(pipefds[1]);
+  if (err != 0)
+    abort();
 
   pipefds[1] = -1;
   uv__nonblock(pipefds[0], 1);
 
-  if (container->data.stream->type == UV_NAMED_PIPE &&
-      ((uv_pipe_t*)container->data.stream)->ipc)
-    flags = UV_STREAM_READABLE | UV_STREAM_WRITABLE;
-  else if (writable)
-    flags = UV_STREAM_WRITABLE;
-  else
-    flags = UV_STREAM_READABLE;
+  flags = 0;
+  if (container->flags & UV_WRITABLE_PIPE)
+    flags |= UV_HANDLE_READABLE;
+  if (container->flags & UV_READABLE_PIPE)
+    flags |= UV_HANDLE_WRITABLE;
 
   return uv__stream_open(container->data.stream, pipefds[0], flags);
 }
@@ -251,7 +183,7 @@ static int uv__process_open_stream(uv_stdio_container_t* container,
 
 static void uv__process_close_stream(uv_stdio_container_t* container) {
   if (!(container->flags & UV_CREATE_PIPE)) return;
-  uv__stream_close((uv_stream_t*)container->data.stream);
+  uv__stream_close(container->data.stream);
 }
 
 
@@ -269,16 +201,43 @@ static void uv__write_int(int fd, int val) {
 }
 
 
+static void uv__write_errno(int error_fd) {
+  uv__write_int(error_fd, UV__ERR(errno));
+  _exit(127);
+}
+
+
+#if !(defined(__APPLE__) && (TARGET_OS_TV || TARGET_OS_WATCH))
+/* execvp is marked __WATCHOS_PROHIBITED __TVOS_PROHIBITED, so must be
+ * avoided. Since this isn't called on those targets, the function
+ * doesn't even need to be defined for them.
+ */
 static void uv__process_child_init(const uv_process_options_t* options,
                                    int stdio_count,
                                    int (*pipes)[2],
                                    int error_fd) {
+  sigset_t set;
   int close_fd;
   int use_fd;
+  int err;
   int fd;
+  int n;
 
   if (options->flags & UV_PROCESS_DETACHED)
     setsid();
+
+  /* First duplicate low numbered fds, since it's not safe to duplicate them,
+   * they could get replaced. Example: swapping stdout and stderr; without
+   * this fd 2 (stderr) would be duplicated into fd 1, thus making both
+   * stdout and stderr go to the same fd, which was not the intention. */
+  for (fd = 0; fd < stdio_count; fd++) {
+    use_fd = pipes[fd][1];
+    if (use_fd < 0 || use_fd >= fd)
+      continue;
+    pipes[fd][1] = fcntl(use_fd, F_DUPFD, stdio_count);
+    if (pipes[fd][1] == -1)
+      uv__write_errno(error_fd);
+  }
 
   for (fd = 0; fd < stdio_count; fd++) {
     close_fd = pipes[fd][0];
@@ -294,20 +253,21 @@ static void uv__process_child_init(const uv_process_options_t* options,
         use_fd = open("/dev/null", fd == 0 ? O_RDONLY : O_RDWR);
         close_fd = use_fd;
 
-        if (use_fd == -1) {
-          uv__write_int(error_fd, -errno);
-          _exit(127);
-        }
+        if (use_fd < 0)
+          uv__write_errno(error_fd);
       }
     }
 
     if (fd == use_fd)
-      uv__cloexec(use_fd, 0);
+      uv__cloexec_fcntl(use_fd, 0);
     else
-      dup2(use_fd, fd);
+      fd = dup2(use_fd, fd);
+
+    if (fd == -1)
+      uv__write_errno(error_fd);
 
     if (fd <= 2)
-      uv__nonblock(fd, 0);
+      uv__nonblock_fcntl(fd, 0);
 
     if (close_fd >= stdio_count)
       uv__close(close_fd);
@@ -316,14 +276,12 @@ static void uv__process_child_init(const uv_process_options_t* options,
   for (fd = 0; fd < stdio_count; fd++) {
     use_fd = pipes[fd][1];
 
-    if (use_fd >= 0 && fd != use_fd)
-      close(use_fd);
+    if (use_fd >= stdio_count)
+      uv__close(use_fd);
   }
 
-  if (options->cwd != NULL && chdir(options->cwd)) {
-    uv__write_int(error_fd, -errno);
-    _exit(127);
-  }
+  if (options->cwd != NULL && chdir(options->cwd))
+    uv__write_errno(error_fd);
 
   if (options->flags & (UV_PROCESS_SETUID | UV_PROCESS_SETGID)) {
     /* When dropping privileges from root, the `setgroups` call will
@@ -336,30 +294,63 @@ static void uv__process_child_init(const uv_process_options_t* options,
     SAVE_ERRNO(setgroups(0, NULL));
   }
 
-  if ((options->flags & UV_PROCESS_SETGID) && setgid(options->gid)) {
-    uv__write_int(error_fd, -errno);
-    _exit(127);
-  }
+  if ((options->flags & UV_PROCESS_SETGID) && setgid(options->gid))
+    uv__write_errno(error_fd);
 
-  if ((options->flags & UV_PROCESS_SETUID) && setuid(options->uid)) {
-    uv__write_int(error_fd, -errno);
-    _exit(127);
-  }
+  if ((options->flags & UV_PROCESS_SETUID) && setuid(options->uid))
+    uv__write_errno(error_fd);
 
   if (options->env != NULL) {
     environ = options->env;
   }
 
+  /* Reset signal disposition.  Use a hard-coded limit because NSIG
+   * is not fixed on Linux: it's either 32, 34 or 64, depending on
+   * whether RT signals are enabled.  We are not allowed to touch
+   * RT signal handlers, glibc uses them internally.
+   */
+  for (n = 1; n < 32; n += 1) {
+    if (n == SIGKILL || n == SIGSTOP)
+      continue;  /* Can't be changed. */
+
+#if defined(__HAIKU__)
+    if (n == SIGKILLTHR)
+      continue;  /* Can't be changed. */
+#endif
+
+    if (SIG_ERR != signal(n, SIG_DFL))
+      continue;
+
+    uv__write_errno(error_fd);
+  }
+
+  /* Reset signal mask. */
+  sigemptyset(&set);
+  err = pthread_sigmask(SIG_SETMASK, &set, NULL);
+
+  if (err != 0)
+    uv__write_errno(error_fd);
+
+#ifdef __MVS__
+  execvpe(options->file, options->args, environ);
+#else
   execvp(options->file, options->args);
-  uv__write_int(error_fd, -errno);
-  _exit(127);
+#endif
+
+  uv__write_errno(error_fd);
 }
+#endif
 
 
 int uv_spawn(uv_loop_t* loop,
              uv_process_t* process,
              const uv_process_options_t* options) {
+#if defined(__APPLE__) && (TARGET_OS_TV || TARGET_OS_WATCH)
+  /* fork is marked __WATCHOS_PROHIBITED __TVOS_PROHIBITED. */
+  return UV_ENOSYS;
+#else
   int signal_pipe[2] = { -1, -1 };
+  int pipes_storage[8][2];
   int (*pipes)[2];
   int stdio_count;
   ssize_t r;
@@ -367,12 +358,15 @@ int uv_spawn(uv_loop_t* loop,
   int err;
   int exec_errorno;
   int i;
+  int status;
 
   assert(options->file != NULL);
   assert(!(options->flags & ~(UV_PROCESS_DETACHED |
                               UV_PROCESS_SETGID |
                               UV_PROCESS_SETUID |
                               UV_PROCESS_WINDOWS_HIDE |
+                              UV_PROCESS_WINDOWS_HIDE_CONSOLE |
+                              UV_PROCESS_WINDOWS_HIDE_GUI |
                               UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS)));
 
   uv__handle_init(loop, (uv_handle_t*)process, UV_PROCESS);
@@ -382,8 +376,11 @@ int uv_spawn(uv_loop_t* loop,
   if (stdio_count < 3)
     stdio_count = 3;
 
-  err = -ENOMEM;
-  pipes = malloc(stdio_count * sizeof(*pipes));
+  err = UV_ENOMEM;
+  pipes = pipes_storage;
+  if (stdio_count > (int) ARRAY_SIZE(pipes_storage))
+    pipes = uv__malloc(stdio_count * sizeof(*pipes));
+
   if (pipes == NULL)
     goto error;
 
@@ -429,7 +426,7 @@ int uv_spawn(uv_loop_t* loop,
   pid = fork();
 
   if (pid == -1) {
-    err = -errno;
+    err = UV__ERR(errno);
     uv_rwlock_wrunlock(&loop->cloexec_lock);
     uv__close(signal_pipe[0]);
     uv__close(signal_pipe[1]);
@@ -453,17 +450,23 @@ int uv_spawn(uv_loop_t* loop,
 
   if (r == 0)
     ; /* okay, EOF */
-  else if (r == sizeof(exec_errorno))
-    ; /* okay, read errorno */
-  else if (r == -1 && errno == EPIPE)
-    ; /* okay, got EPIPE */
-  else
+  else if (r == sizeof(exec_errorno)) {
+    do
+      err = waitpid(pid, &status, 0); /* okay, read errorno */
+    while (err == -1 && errno == EINTR);
+    assert(err == pid);
+  } else if (r == -1 && errno == EPIPE) {
+    do
+      err = waitpid(pid, &status, 0); /* okay, got EPIPE */
+    while (err == -1 && errno == EINTR);
+    assert(err == pid);
+  } else
     abort();
 
-  uv__close(signal_pipe[0]);
+  uv__close_nocheckstdio(signal_pipe[0]);
 
   for (i = 0; i < options->stdio_count; i++) {
-    err = uv__process_open_stream(options->stdio + i, pipes[i], i == 0);
+    err = uv__process_open_stream(options->stdio + i, pipes[i]);
     if (err == 0)
       continue;
 
@@ -482,7 +485,9 @@ int uv_spawn(uv_loop_t* loop,
   process->pid = pid;
   process->exit_cb = options->exit_cb;
 
-  free(pipes);
+  if (pipes != pipes_storage)
+    uv__free(pipes);
+
   return exec_errorno;
 
 error:
@@ -492,14 +497,17 @@ error:
         if (options->stdio[i].flags & (UV_INHERIT_FD | UV_INHERIT_STREAM))
           continue;
       if (pipes[i][0] != -1)
-        close(pipes[i][0]);
+        uv__close_nocheckstdio(pipes[i][0]);
       if (pipes[i][1] != -1)
-        close(pipes[i][1]);
+        uv__close_nocheckstdio(pipes[i][1]);
     }
-    free(pipes);
+
+    if (pipes != pipes_storage)
+      uv__free(pipes);
   }
 
   return err;
+#endif
 }
 
 
@@ -510,7 +518,7 @@ int uv_process_kill(uv_process_t* process, int signum) {
 
 int uv_kill(int pid, int signum) {
   if (kill(pid, signum))
-    return -errno;
+    return UV__ERR(errno);
   else
     return 0;
 }

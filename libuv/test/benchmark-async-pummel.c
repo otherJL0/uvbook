@@ -41,7 +41,7 @@ static void async_cb(uv_async_t* handle) {
     /* Tell the pummel thread to stop. */
     ACCESS_ONCE(const char*, handle->data) = stop;
 
-    /* Wait for for the pummel thread to acknowledge that it has stoppped. */
+    /* Wait for the pummel thread to acknowledge that it has stoppped. */
     while (ACCESS_ONCE(const char*, handle->data) != stopped)
       uv_sleep(0);
 
@@ -68,7 +68,7 @@ static int test_async_pummel(int nthreads) {
   int i;
 
   tids = calloc(nthreads, sizeof(tids[0]));
-  ASSERT(tids != NULL);
+  ASSERT_NOT_NULL(tids);
 
   ASSERT(0 == uv_async_init(uv_default_loop(), &handle, async_cb));
   ACCESS_ONCE(const char*, handle.data) = running;

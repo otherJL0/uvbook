@@ -49,7 +49,7 @@ BENCHMARK_IMPL(million_timers) {
   int i;
 
   timers = malloc(NUM_TIMERS * sizeof(timers[0]));
-  ASSERT(timers != NULL);
+  ASSERT_NOT_NULL(timers);
 
   loop = uv_default_loop();
   timeout = 0;
@@ -75,10 +75,11 @@ BENCHMARK_IMPL(million_timers) {
   ASSERT(close_cb_called == NUM_TIMERS);
   free(timers);
 
-  LOGF("%.2f seconds total\n", (after_all - before_all) / 1e9);
-  LOGF("%.2f seconds init\n", (before_run - before_all) / 1e9);
-  LOGF("%.2f seconds dispatch\n", (after_run - before_run) / 1e9);
-  LOGF("%.2f seconds cleanup\n", (after_all - after_run) / 1e9);
+  fprintf(stderr, "%.2f seconds total\n", (after_all - before_all) / 1e9);
+  fprintf(stderr, "%.2f seconds init\n", (before_run - before_all) / 1e9);
+  fprintf(stderr, "%.2f seconds dispatch\n", (after_run - before_run) / 1e9);
+  fprintf(stderr, "%.2f seconds cleanup\n", (after_all - after_run) / 1e9);
+  fflush(stderr);
 
   MAKE_VALGRIND_HAPPY();
   return 0;
